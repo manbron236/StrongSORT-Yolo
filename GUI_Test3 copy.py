@@ -11,22 +11,22 @@ from deep_sort_realtime.deepsort_tracker import DeepSort
 # Initialize the main application window
 root = tk.Tk()
 root.title("YOLO Zone Management with Counting")
+root.geometry("1200x800")  # 기본 윈도우 크기 설정
+root.state('zoomed')  # 전체 화면으로 설정
 
-# Create a frame for the video display
-video_frame = tk.Frame(root, width=600, height=400)
-video_frame.pack(side=tk.LEFT, padx=10, pady=10)
+# Layout Frames
+video_frame = tk.Frame(root)  # 캠 화면을 위한 프레임
+video_frame.pack(fill=tk.BOTH, expand=True)
+
+control_frame = tk.Frame(root, bg="lightgray", height=150)  # 버튼들을 위한 프레임
+control_frame.pack(fill=tk.X, padx=10, pady=10)
+
+table_frame = tk.Frame(root, bg="white", height=150)  # 테이블을 위한 프레임
+table_frame.pack(fill=tk.X, padx=10, pady=10)
 
 # Create a canvas for the video feed
-video_label = tk.Canvas(video_frame, width=600, height=400, bg="black")
-video_label.pack()
-
-# Create a frame for controls
-control_frame = tk.Frame(root)
-control_frame.pack(side=tk.RIGHT, padx=10, pady=30, fill=tk.Y)
-
-# Create a table for counting results
-table_frame = tk.Frame(root)
-table_frame.pack(side=tk.BOTTOM, padx=10, pady=10, fill=tk.X)
+video_label = tk.Canvas(video_frame)
+video_label.pack(fill=tk.BOTH, expand=True)
 
 columns = ("date", "time", "entry", "stay", "exit", "total")
 table = ttk.Treeview(table_frame, columns=columns, show="headings", height=5)
@@ -47,45 +47,65 @@ frame = None
 entry_count, stay_count, exit_count = 0, 0, 0
 lock = threading.Lock()
 
+# Event objects for thread synchronization
+camera_ready = threading.Event()
+model_ready = threading.Event()
+
+# Frame processing interval (only process every Nth frame)
+process_frame_interval = 2  # N 프레임 중 1 프레임만 처리
+frame_count = 0
+
 # Drawing data structures for lines and boxes
 lines = {"entry": [], "exit": []}  # Entry and exit lines
 boxes = []  # Counting boxes
 current_object = None
 
+# Global variable 추가
+processed_frame = None  # 모델에서 처리된 프레임
+
 def camera_thread():
-    """Capture frames from the RTSP stream or webcam."""
     global frame
     rtsp_url = "rtsp://admin:Bora7178@dev99ok.iptime.org:1038/profile2/media.smp"
-    
     cap = cv2.VideoCapture(rtsp_url)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    cap.set(cv2.CAP_PROP_FPS, 30)  # RTSP 스트림에 맞게 설정
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+
     while cap.isOpened():
-        ret, img = cap.read()
+        cap.grab()  # 가장 최신 프레임 읽기
+        ret, img = cap.retrieve()
         if not ret:
-            print("Failed to retrieve frame. Retrying...")
+            print("RTSP stream lost. Reconnecting...")
+            time.sleep(1)
             cap = cv2.VideoCapture(rtsp_url)
             continue
+
         with lock:
-            frame = cv2.resize(img, (600, 400))
-        time.sleep(0.03)
+            frame = img.copy()
+        camera_ready.set()
+        time.sleep(0.01)  # 딜레이 최소화
+
 
 def model_thread():
-    """Run YOLO detection and DeepSort tracking."""
-    global entry_count, stay_count, exit_count, frame
+    global processed_frame, entry_count, stay_count, exit_count, frame_count
     while True:
+        camera_ready.wait()  # Wait for a new frame
         with lock:
             if frame is None:
                 continue
             img = frame.copy()
 
+        frame_count += 1
+        if frame_count % process_frame_interval != 0:
+            with lock:
+                processed_frame = img
+            model_ready.set()  # Notify ui_thread
+            continue
+
         results = model(img)
         detections = []
         for result in results:
-            for id, box in enumerate(result.boxes.xyxy):
-                cls = int(result.boxes.cls[id])
-                conf = result.boxes.conf[id]
-                if cls == 0:  # 'person' class only
+            for box, conf, cls in zip(result.boxes.xyxy, result.boxes.conf, result.boxes.cls):
+                if int(cls) == 0:  # Detect only 'person'
                     x1, y1, x2, y2 = map(int, box)
                     detections.append(([x1, y1, x2, y2], conf))
 
@@ -94,51 +114,76 @@ def model_thread():
         for track in tracks:
             if not track.is_confirmed():
                 continue
-
             track_id = track.track_id
             x1, y1, x2, y2 = map(int, track.to_ltwh())
-            print(f"Tracking ID {track_id}: x1={x1}, y1={y1}, x2={x2}, y2={y2}")
             center = get_center((x1, y1, x2, y2))
 
-            # Check entry line crossing
             for line in lines["entry"]:
                 if check_line_crossing(center, line):
                     entry_count += 1
 
-            # Check stay in counting box
             for box in boxes:
                 if check_in_box(center, box):
                     current_stay_count += 1
 
-            # Check exit line crossing
             for line in lines["exit"]:
                 if check_line_crossing(center, line):
                     exit_count += 1
 
+            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(img, f"ID {track_id}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            img = apply_mosaic(img, x1, y1, x2, y2)
+
         with lock:
             stay_count = current_stay_count
-        time.sleep(0.03)
+            processed_frame = img
+        model_ready.set()  # Notify ui_thread
+        camera_ready.clear()
 
 def ui_thread():
-    """Update the UI and display frames with detections."""
-    global frame
     while True:
+        model_ready.wait()  # Wait for processed frame
         with lock:
-            if frame is None:
+            if processed_frame is None:
                 continue
-            img = frame.copy()
+            img = processed_frame.copy()
 
-        # Convert frame to Tkinter format
-        frame_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        label_width = video_label.winfo_width()
+        label_height = video_label.winfo_height()
+        img_height, img_width = img.shape[:2]
+        scale = min(label_width / img_width, label_height / img_height)
+        resized_img = cv2.resize(img, (int(img_width * scale), int(img_height * scale)))
+
+        frame_rgb = cv2.cvtColor(resized_img, cv2.COLOR_BGR2RGB)
         img_tk = ImageTk.PhotoImage(image=Image.fromarray(frame_rgb))
-        
-        video_label.create_image(0, 0, anchor=tk.NW, image=img_tk)
-        video_label.imgtk = img_tk  # Keep reference to avoid garbage collection
-
-        redraw_objects()  # Draw lines and boxes on the frame
+        video_label.create_image(label_width // 2, label_height // 2, anchor=tk.CENTER, image=img_tk)
+        video_label.imgtk = img_tk
+        redraw_objects()
         root.update_idletasks()
-        time.sleep(0.03)
+        model_ready.clear()
 
+
+def apply_mosaic(image, x1, y1, x2, y2):
+    """Apply mosaic to a given region with coordinate validation."""
+    h, w, _ = image.shape
+
+    # 좌표 유효성 검사 및 클램핑
+    x1 = max(0, min(x1, w))
+    y1 = max(0, min(y1, h))
+    x2 = max(0, min(x2, w))
+    y2 = max(0, min(y2, h))
+
+    # 유효한 영역인지 확인
+    if x1 >= x2 or y1 >= y2:
+        print(f"Invalid region for mosaic: ({x1}, {y1}), ({x2}, {y2})")
+        return image
+
+    # 모자이크 적용
+    sub_img = image[y1:y2, x1:x2]
+    sub_img = cv2.resize(sub_img, (10, 10), interpolation=cv2.INTER_LINEAR)
+    sub_img = cv2.resize(sub_img, (x2 - x1, y2 - y1), interpolation=cv2.INTER_NEAREST)
+    image[y1:y2, x1:x2] = sub_img
+    return image
 
 def get_center(box):
     """Calculate the center of a bounding box."""
@@ -177,30 +222,108 @@ def update_table():
         )
     root.after(1000, update_table)
 
-# 선을 그리는 함수
+def get_valid_canvas_area():
+    """캠 화면 내에서만 그리기가 가능하도록 경계를 반환."""
+    if processed_frame is None:
+        return None
+
+    # 캠 화면의 실제 크기
+    frame_height, frame_width = processed_frame.shape[:2]
+
+    # Tkinter에서 표시되는 캔버스 크기
+    canvas_width = video_label.winfo_width()
+    canvas_height = video_label.winfo_height()
+
+    # 비율 계산
+    scale = min(canvas_width / frame_width, canvas_height / frame_height)
+
+    # 캠 화면의 유효 영역 계산
+    valid_width = int(frame_width * scale)
+    valid_height = int(frame_height * scale)
+
+    # 중앙에 배치된 영역
+    x_offset = (canvas_width - valid_width) // 2
+    y_offset = (canvas_height - valid_height) // 2
+
+    return x_offset, y_offset, valid_width, valid_height
+
+def is_within_valid_area(x, y):
+    """주어진 좌표가 캠 화면의 유효 영역 내에 있는지 확인."""
+    valid_area = get_valid_canvas_area()
+    if valid_area is None:
+        return False
+
+    x_offset, y_offset, valid_width, valid_height = valid_area
+
+    # 좌표가 유효 영역 내에 있는지 확인
+    return x_offset <= x <= x_offset + valid_width and y_offset <= y <= y_offset + valid_height
+
+
 def start_draw(event):
+    """그리기를 시작합니다."""
     global current_object
+
+    if not is_within_valid_area(event.x, event.y):
+        print("그리기 시작 좌표가 캠 화면 바깥입니다.")
+        return  # 유효하지 않은 좌표면 종료
+
     current_object = {"start": (event.x, event.y), "end": None}
 
 def draw_object(event):
+    """그리기 중입니다."""
     global current_object
-    if current_object:
+
+    if current_object and is_within_valid_area(event.x, event.y):
         current_object["end"] = (event.x, event.y)
         threading.Thread(target=draw_in_background).start()
 
 def finish_draw(event):
+    """Finish drawing and save the object."""
     global current_object
     if current_object and current_object.get("end"):
         x1, y1 = current_object["start"]
         x2, y2 = event.x, event.y
+
+        # 캠 화면 유효 영역 가져오기
+        valid_area = get_valid_canvas_area()
+        if valid_area is None:
+            print("캠 화면의 유효 영역을 가져올 수 없습니다.")
+            return
+
+        x_offset, y_offset, valid_width, valid_height = valid_area
+
+        # 좌표가 유효 영역 내에 있는지 확인
+        if not (x_offset <= x1 <= x_offset + valid_width and
+                y_offset <= y1 <= y_offset + valid_height and
+                x_offset <= x2 <= x_offset + valid_width and
+                y_offset <= y2 <= y_offset + valid_height):
+            print("그리기 좌표가 캠 화면 바깥입니다. 그리기를 취소합니다.")
+            current_object = None
+            return
+
         if draw_mode.get() == "line":
+            # 입장선과 퇴장선은 각각 하나만 생성 가능
             if line_type.get() == "entry":
-                lines["entry"].append({"start": (x1, y1), "end": (x2, y2)})
+                if len(lines["entry"]) == 0:  # 입장선이 없다면 추가
+                    lines["entry"].append({"start": (x1, y1), "end": (x2, y2)})
+                else:
+                    print("Entry line already exists. Only one allowed.")
             elif line_type.get() == "exit":
-                lines["exit"].append({"start": (x1, y1), "end": (x2, y2)})
+                if len(lines["exit"]) == 0:  # 퇴장선이 없다면 추가
+                    lines["exit"].append({"start": (x1, y1), "end": (x2, y2)})
+                else:
+                    print("Exit line already exists. Only one allowed.")
         elif draw_mode.get() == "box":
-            boxes.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2})
+            # 카운팅 박스는 하나만 생성 가능
+            if len(boxes) == 0:
+                boxes.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2})
+            else:
+                print("Counting box already exists. Only one allowed.")
+
     current_object = None
+    redraw_objects()  # 객체를 다시 그립니다.
+
+
 
 # 별도의 스레드에서 선을 그리는 함수
 def draw_in_background():
@@ -221,29 +344,69 @@ def redraw_objects():
         x1, y1 = obj["x1"], obj["y1"]
         x2, y2 = obj["x2"], obj["y2"]
         video_label.create_rectangle(x1, y1, x2, y2, outline="red", width=2, tags="object")
+# 선과 박스 삭제 함수
+def delete_entry_line():
+    """Delete the entry line."""
+    lines["entry"].clear()  # 입장선 리스트 초기화
+    redraw_objects()  # 다시 그리기
+
+def delete_exit_line():
+    """Delete the exit line."""
+    lines["exit"].clear()  # 퇴장선 리스트 초기화
+    redraw_objects()  # 다시 그리기
+
+def delete_counting_box():
+    """Delete the counting box."""
+    boxes.clear()  # 카운팅 박스 리스트 초기화
+    redraw_objects()  # 다시 그리기
+
+def delete_all():
+    """Delete all lines and boxes."""
+    lines["entry"].clear()
+    lines["exit"].clear()
+    boxes.clear()  # 모든 리스트 초기화
+    redraw_objects()  # 다시 그리기
 
 # Initialize Tkinter UI elements for drawing mode and line type
 draw_mode = tk.StringVar(value="line")
 line_type = tk.StringVar(value="entry")
 
-tk.Label(control_frame, text="Drawing Mode").pack()
-tk.Radiobutton(control_frame, text="Line", variable=draw_mode, value="line").pack()
-tk.Radiobutton(control_frame, text="Box", variable=draw_mode, value="box").pack()
-tk.Label(control_frame, text="Line Type").pack()
-tk.Radiobutton(control_frame, text="Entry Line", variable=line_type, value="entry").pack()
-tk.Radiobutton(control_frame, text="Exit Line", variable=line_type, value="exit").pack()
+# Control Frame UI
+tk.Label(control_frame, text="Drawing Mode", bg="lightgray", font=("Arial", 12)).grid(row=0, column=0, pady=10, sticky="w")
+draw_mode = tk.StringVar(value="line")
+tk.Radiobutton(control_frame, text="Line", variable=draw_mode, value="line", bg="lightgray").grid(row=0, column=1, sticky="w")
+tk.Radiobutton(control_frame, text="Box", variable=draw_mode, value="box", bg="lightgray").grid(row=0, column=2, sticky="w")
+
+tk.Label(control_frame, text="Line Type", bg="lightgray", font=("Arial", 12)).grid(row=1, column=0, pady=10, sticky="w")
+line_type = tk.StringVar(value="entry")
+tk.Radiobutton(control_frame, text="Entry Line", variable=line_type, value="entry", bg="lightgray").grid(row=1, column=1, sticky="w")
+tk.Radiobutton(control_frame, text="Exit Line", variable=line_type, value="exit", bg="lightgray").grid(row=1, column=2, sticky="w")
+
+tk.Label(control_frame, text="Actions", bg="lightgray", font=("Arial", 12)).grid(row=2, column=0, pady=10, sticky="w")
+delete_entry_button = tk.Button(control_frame, text="Delete Entry Line", command=delete_entry_line)
+delete_entry_button.grid(row=2, column=1, sticky="w")
+
+delete_exit_button = tk.Button(control_frame, text="Delete Exit Line", command=delete_exit_line)
+delete_exit_button.grid(row=2, column=2, sticky="w")
+
+delete_box_button = tk.Button(control_frame, text="Delete Counting Box", command=delete_counting_box)
+delete_box_button.grid(row=2, column=3, sticky="w")
+
+delete_all_button = tk.Button(control_frame, text="Delete All", command=delete_all)
+delete_all_button.grid(row=2, column=4, sticky="w")
+
+confidence_slider = tk.Scale(control_frame, from_=0, to_=100, orient=tk.HORIZONTAL, length=150, label="Confidence")
+confidence_slider.set(50)
+confidence_slider.grid(row=3, column=0, columnspan=5, pady=10, sticky="we")
 
 video_label.bind("<Button-1>", start_draw)
 video_label.bind("<B1-Motion>", draw_object)
 video_label.bind("<ButtonRelease-1>", finish_draw)
 
 # Start threads
-camera_thread = threading.Thread(target=camera_thread, daemon=True)
-model_thread = threading.Thread(target=model_thread, daemon=True)
-ui_thread = threading.Thread(target=ui_thread, daemon=True)
-camera_thread.start()
-model_thread.start()
-ui_thread.start()
+threading.Thread(target=camera_thread, daemon=True).start()
+threading.Thread(target=model_thread, daemon=True).start()
+threading.Thread(target=ui_thread, daemon=True).start()
 
 # Schedule the table update loop
 root.after(1000, update_table)
