@@ -1,4 +1,3 @@
-
 import argparse
 import os
 # limit the number of cpus used by high performance libraries
@@ -65,6 +64,8 @@ def face_mosaic(image, x, y, w, h, ratio=0.1):
     :param ratio: Mosaic size ratio (smaller values give finer mosaics)
     :return: Image with mosaic applied on the face area
     """
+    if w <= 0 or h <= 0:
+        return image  # Skip mosaic if width or height is non-positive
     face = image[y:y+h, x:x+w]
     face = cv2.resize(face, (int(w * ratio), int(h * ratio)), interpolation=cv2.INTER_LINEAR)
     face = cv2.resize(face, (w, h), interpolation=cv2.INTER_NEAREST)
@@ -104,9 +105,7 @@ def run(
         dnn=False,  # use OpenCV DNN for ONNX inference
         count=False,  # get counts of every obhects
         draw=False,  # draw object trajectory lines
-
 ):
-
     source = str(source)
     save_img = not nosave and not source.endswith('.txt')  # save inference images
     is_file = Path(source).suffix[1:] in (VID_FORMATS)
@@ -163,7 +162,6 @@ def run(
                 nn_budget=cfg.STRONGSORT.NN_BUDGET,
                 mc_lambda=cfg.STRONGSORT.MC_LAMBDA,
                 ema_alpha=cfg.STRONGSORT.EMA_ALPHA,
-
             )
         )
     outputs = [None] * nr_sources
