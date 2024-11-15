@@ -97,6 +97,7 @@ def model_thread():
 
             track_id = track.track_id
             x1, y1, x2, y2 = map(int, track.to_ltwh())
+            print(f"Tracking ID {track_id}: x1={x1}, y1={y1}, x2={x2}, y2={y2}")
             center = get_center((x1, y1, x2, y2))
 
             # Check entry line crossing
