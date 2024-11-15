@@ -65,6 +65,8 @@ def face_mosaic(image, x, y, w, h, ratio=0.1):
     :param ratio: Mosaic size ratio (smaller values give finer mosaics)
     :return: Image with mosaic applied on the face area
     """
+    if w <= 0 or h <= 0:
+        return image  # Skip mosaic if width or height is non-positive
     face = image[y:y+h, x:x+w]
     face = cv2.resize(face, (int(w * ratio), int(h * ratio)), interpolation=cv2.INTER_LINEAR)
     face = cv2.resize(face, (w, h), interpolation=cv2.INTER_NEAREST)
